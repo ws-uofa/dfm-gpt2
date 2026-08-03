@@ -1,4 +1,4 @@
-# DFM for GPT-2 on WikiText-103
+# dfm-gpt2
 
 这是一个从实验仓库重新整理出的最小、独立实现。仓库只包含源代码、配置示例和
 CPU 测试；不依赖原 `DeepFusionMem` 仓库，也不把模型、WikiText-103、FAISS
@@ -63,7 +63,7 @@ tests/                       无网络、CPU 单元测试
 `/plm-dhw/sunsiyuan/DEEPFUSIONMEM/artifacts/wikitext103-db-ablation-v1`。
 这些路径可以迁移；代码只通过 CLI 参数或环境变量接收路径。禁止把慢盘上的大文件
 复制进仓库。活动 checkpoint 建议写入
-`/plm-shared/sunsiyuan/DEEPFUSIONMEM_FAST/runs/dfm-wikitext103`，确认有价值后再
+`/plm-shared/sunsiyuan/DEEPFUSIONMEM_FAST/runs/dfm-gpt2`，确认有价值后再
 同步到慢盘归档。
 
 ## 环境
@@ -71,7 +71,7 @@ tests/                       无网络、CPU 单元测试
 当前机器已验证环境：
 
 ```bash
-cd /plm-shared/sunsiyuan/dfm-wikitext103
+cd /plm-shared/sunsiyuan/dfm-gpt2
 source configs/paths.env.example
 export PYTHONPATH=$PWD
 /plm-shared/sunsiyuan/.venvs/dfm/bin/python -m pytest

@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dfm-wikitext103"
+name = "dfm-gpt2"
 version = "0.1.0"
 description = "Readable GPT-2 DFM reference implementation for WikiText-103"
 requires-python = ">=3.10"
