@@ -68,17 +68,44 @@ tests/                       无网络、CPU 单元测试
 
 ## 环境
 
-当前机器已验证环境：
+运行依赖写在 `requirements.txt`，测试依赖写在 `requirements-dev.txt`。
+`pyproject.toml` 使用相同约束，避免 editable install 和 requirements 安装得到
+不同环境。当前机器复用持久共享环境 `/plm-shared/sunsiyuan/.venvs/dfm`，不在
+仓库内创建 `.venv`。
+
+首次使用时创建机器本地配置：
 
 ```bash
 cd /plm-shared/sunsiyuan/dfm-gpt2
-source configs/paths.env.example
-export PYTHONPATH=$PWD
-/plm-shared/sunsiyuan/.venvs/dfm/bin/python -m pytest
+cp configs/paths.env.example configs/local.env
+# 按机器修改 configs/local.env；该文件已被 Git 忽略。
+source scripts/activate_local_env.sh
+bash scripts/setup_environment.sh
 ```
 
-若在其他机器安装，使用 `pip install -e '.[dev]'`。GPU 训练必须通过集群任务执行，
-开发机只用于代码检查和 CPU 测试。
+本机已经整理好 `configs/local.env`。环境脚本默认只做项目依赖导入检查、CPU
+测试和 shell 静态检查，不修改共享环境。确实需要安装或更新依赖时显式执行：
+
+```bash
+PYTHON_BIN=/plm-shared/sunsiyuan/.venvs/dfm/bin/python \
+  bash scripts/setup_environment.sh --install
+```
+
+`--pip-check` 会额外检查共享环境中的所有包。当前共享环境内与本项目无关的
+`autofaiss 2.17.0` 存在缺少可选依赖及旧版 NumPy/PyArrow 约束冲突，因此该检查
+会给出警告，但不影响 dfm-gpt2 的依赖导入和测试。
+
+也可以用 `$PYTHON_BIN scripts/check_environment.py` 输出机器可读的版本、路径与
+CUDA 可见性报告。当前开发机没有可见 GPU 属于正常现象；GPU 训练必须通过集群
+任务执行。`configs/accelerate/local_cpu.yaml` 用于本地检查，`1_gpu.yaml` 和
+`4_gpu.yaml` 用于相应的单节点集群容器。
+
+若在其他机器创建全新环境，可在个人持久快盘上执行：
+
+```bash
+python3 -m venv /plm-shared/sunsiyuan/.venvs/dfm-gpt2
+/plm-shared/sunsiyuan/.venvs/dfm-gpt2/bin/python -m pip install -r requirements-dev.txt
+```
 
 ## 建库
 

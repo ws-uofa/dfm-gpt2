@@ -1,0 +1,12 @@
+# Runtime dependencies tested with Python 3.12 on the new-T development host.
+# The cluster image supplies its CUDA-compatible PyTorch build, so PyTorch is
+# intentionally constrained to an API-compatible range rather than an
+# unavailable NVIDIA development wheel hash.
+torch>=2.2,<3
+transformers==4.51.3
+accelerate==1.1.0
+datasets==4.8.4
+numpy>=1.26,<3
+faiss-cpu==1.14.3
+safetensors>=0.4,<1
+
