@@ -6,9 +6,9 @@ CPU 测试；不依赖原 `DeepFusionMem` 仓库，也不把模型、WikiText-10
 
 ## 实现范围
 
-固定支持以下闭环：
+支持以下闭环；下列数值都是当前已验证 setting 的默认值，不是代码限制：
 
-1. 最新已验证的 WikiText-103 建库协议：`cross_article` packing，1024-token
+1. 最新已验证的 WikiText-103 默认建库协议：`cross_article` packing，1024-token
    block，16-token chunk，previous-chunk query，Top-16 key，并为每个 key 加入
    immediate continuation，最终共 32 memory slots；训练集检索排除当前 block。
 2. GPT-2 traditional DFM：冻结 GPT-2，共享 memory projector，在层
@@ -20,6 +20,9 @@ CPU 测试；不依赖原 `DeepFusionMem` 仓库，也不把模型、WikiText-10
    ```text
    L = NLL(retrieved) + weight * relu(margin + NLL(retrieved) - NLL(random))
    ```
+
+所有常用 ablation 都通过 CLI 参数表达。完整默认值也集中记录在
+[`configs/defaults.json`](configs/defaults.json)，方便审阅和生成实验 manifest。
 
 刻意没有收录 Llama/Mistral、DDFM、NQ、旧消融、几十组 submission recipe 和
 结果汇总脚本。这样核心实现保持在人可以完整阅读的规模。
@@ -99,6 +102,41 @@ $PYTHON_BIN scripts/build_wikitext103.py all \
 正式运行可使用 `scripts/build_latest_wikitext103.sh`。它只负责容器内执行，不负责
 申请 GPU；提交前应另外用平台的通用 ClusterX wrapper 做 dry-run。
 
+### 建库消融参数
+
+| CLI 参数 | 默认值 | 消融含义 |
+|---|---:|---|
+| `--packing-mode` | `cross_article` | 可选 `article_only`；后者不让 LM block 或 datastore pair 跨文章，并保留文章末尾 partial block |
+| `--block-size` | `1024` | GPT-2 LM block 长度 |
+| `--chunk-size` | `16` | query/key/continuation chunk 长度，必须整除 block size |
+| `--top-k` | `16` | 每个 query 保留的近邻 key 数 |
+| `--continuation` | `append` | `none`=仅 key，`append`=key+continuation，`only`=仅 continuation |
+| `--exclude-current-block` | true | 同时检查 candidate key 与 continuation 所属 block |
+| `--exclude-current-article` | false | 同时检查 candidate key 与 continuation 所属 article |
+| `--candidate-pool` | `2048` | exclusion 前的 ANN 候选数 |
+| `--index-type` | `ivf_pq` | 可选 `flat`、`ivf_flat`、`ivf_pq` |
+| `--metric` | `inner_product` | 可选 `inner_product`、`l2` |
+| `--nlist/--nprobe` | `10942/32` | IVF 参数 |
+| `--pq-code-size/--pq-nbits` | `64/8` | PQ 参数 |
+| `--embedding-max-length` | `64` | Qwen embedding tokenizer 上限 |
+| `--prepared-name` | `exclude-block` | 同一 datastore 下不同 prepared view 的目录名 |
+
+布尔参数使用 Python BooleanOptionalAction，例如
+`--no-exclude-current-block --exclude-current-article`。每一组改变 tokenization、
+packing、chunk 或 continuation 的实验应使用新的 `WT103_ARTIFACT` 目录；脚本遇到
+已有 stage 会拒绝覆盖。只改变 Top-K 或 exclusion 时可以复用 datastore，但应使用
+不同的 `--prepared-name` 单独执行 `prepare` stage。
+
+示例：article-only、chunk 32、仅 key、Top-32：
+
+```bash
+$PYTHON_BIN scripts/build_wikitext103.py all \
+  --dataset "$WIKITEXT103" --gpt2-tokenizer "$GPT2_MODEL" \
+  --embedding-model "$EMBEDDING_MODEL" --output "$NEW_ARTIFACT" \
+  --packing-mode article_only --block-size 1024 --chunk-size 32 \
+  --top-k 32 --continuation none --prepared-name article-key-top32
+```
+
 margin loss 还需要一次性生成负样本：
 
 ```bash
@@ -110,7 +148,8 @@ $PYTHON_BIN scripts/build_random_negative.py \
 
 ## 训练入口及意图
 
-所有训练脚本接受额外 CLI 参数，例如 smoke 可追加 `--max-steps 20`。
+所有训练脚本接受额外 CLI 参数；追加值会覆盖默认值。例如 smoke 可追加
+`--max-steps 20`。
 
 | 脚本 | 意图 |
 |---|---|
@@ -130,6 +169,39 @@ bash scripts/train_traditional_ce.sh --max-steps 20 --batch-size 1
 默认学习率为 `1e-3`、weight decay 为 0、gradient clipping 为 1、seed 42。
 GPT-2 所有参数都冻结并保持 eval mode；checkpoint 只保存新增 DFM 参数及
 `run.json`，避免重复保存基础模型。
+
+### 模型与训练消融参数
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `--fusion-layers` | `0,2,5,8,10,11` | memory 插入层；层数由列表长度决定 |
+| `--memory-dim` | `1024` | datastore vector 维度，启动时与 meta 校验 |
+| `--chunk-size/--top-k` | `16/16` | 必须与 prepared artifact 兼容；允许读取已存 Top-K 的严格前缀 |
+| `--memory-value-mode` | `key_plus_continuation` | `key`、`continuation` 或二者交错 |
+| `--projector-hidden` | `768` | traditional DFM 共享 projector 中间宽度 |
+| `--memory-attention-heads` | `12` | traditional DFM memory attention heads |
+| `--gate-type` | `token_wise_per_head` | `none`、静态 `per_head`、token-wise 或 concat token-wise |
+| `--gate-init` | `0.0` | sigmoid 前 logit；默认 gate=0.5 |
+| `--memory-attention-dropout` | `0` | traditional memory attention dropout |
+| `--reader-dim/layers/heads` | `256/4/8` | transformer-only reader 规模 |
+| `--reader-ff-multiplier` | `4` | reader FFN expansion |
+| `--reader-topology` | `causal` | `causal` 或 `bidirectional` memory prefix attention |
+| `--reader-write` | `residual` | `residual` 或 `replace`；无有效 memory 时均严格 no-op |
+| `--loss` | `ce` | `ce` 或 `margin` |
+| `--margin/--margin-weight` | `0.05/0.1` | hinge margin 及其 loss 权重 |
+| `--learning-rate` | `1e-3` | AdamW learning rate |
+| `--weight-decay` | `0` | AdamW weight decay |
+| `--warmup-steps` | `0` | linear scheduler warmup |
+| `--max-grad-norm` | `1` | gradient clipping |
+| `--batch-size/--gradient-accumulation` | `2/1` | 每进程 batch 与累积步数 |
+| `--epochs/--max-steps` | `1/-1` | 训练预算；正 max-steps 会截断 epoch |
+
+例如只在 GPT-2 最后两层融合，并扫更强 margin：
+
+```bash
+bash scripts/train_traditional_margin.sh \
+  --fusion-layers 10,11 --margin 0.05 --margin-weight 1.0
+```
 
 训练后使用同一批 test rows 做三条件评估；`--checkpoint` 指向具体的
 `step-XXXXXXXX` 目录：

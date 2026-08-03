@@ -19,13 +19,18 @@ class DFMConfig:
 
     # Traditional DFM: shared projector, independent per-layer attention/gates.
     traditional_projector_hidden: int = 768
+    memory_attention_heads: int = 12
+    gate_type: Literal["none", "per_head", "token_wise_per_head", "token_wise_per_head_concat"] = "token_wise_per_head"
     gate_init: float = 0.0  # sigmoid(0) = 0.5
+    memory_attention_dropout: float = 0.0
 
     # Transformer-only DFM: the strongest declared reader configuration.
     reader_dim: int = 256
     reader_layers: int = 4
     reader_heads: int = 8
     reader_ff_multiplier: int = 4
+    reader_topology: Literal["causal", "bidirectional"] = "causal"
+    reader_write: Literal["residual", "replace"] = "residual"
 
     def validate(self, gpt2_layers: int) -> None:
         if self.architecture not in {"traditional", "transformer_only"}:
@@ -36,6 +41,14 @@ class DFMConfig:
             raise ValueError("fusion layer lies outside GPT-2")
         if self.reader_dim % self.reader_heads:
             raise ValueError("reader_heads must divide reader_dim")
+        if self.traditional_projector_hidden <= 0:
+            raise ValueError("traditional_projector_hidden must be positive")
+        if not 0 <= self.memory_attention_dropout < 1:
+            raise ValueError("memory_attention_dropout must be in [0, 1)")
+        if self.reader_topology not in {"causal", "bidirectional"}:
+            raise ValueError("unsupported reader_topology")
+        if self.reader_write not in {"residual", "replace"}:
+            raise ValueError("unsupported reader_write")
 
 
 @dataclass(frozen=True)

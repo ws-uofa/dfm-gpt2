@@ -14,4 +14,4 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
   --dataset "${WIKITEXT103}" \
   --gpt2-tokenizer "${GPT2_MODEL}" \
   --embedding-model "${EMBEDDING_MODEL}" \
-  --output "${WT103_ARTIFACT}"
+  --output "${WT103_ARTIFACT}" "$@"

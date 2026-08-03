@@ -13,7 +13,13 @@ from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 
 from .config import DFMConfig, LossConfig
-from .data import Datastore, MemoryCollator, PairedDataset, load_prepared_split
+from .data import (
+    Datastore,
+    MemoryCollator,
+    PairedDataset,
+    load_prepared_split,
+    validate_data_contract,
+)
 from .losses import margin_loss, token_nll
 from .model import DFMForCausalLM
 
@@ -25,6 +31,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datastore", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--architecture", choices=("traditional", "transformer_only"), required=True)
+    parser.add_argument("--fusion-layers", default="0,2,5,8,10,11")
+    parser.add_argument("--memory-dim", type=int, default=1024)
+    parser.add_argument("--chunk-size", type=int, default=16)
+    parser.add_argument("--top-k", type=int, default=16)
+    parser.add_argument(
+        "--memory-value-mode",
+        choices=("key", "continuation", "key_plus_continuation"),
+        default="key_plus_continuation",
+    )
+    parser.add_argument("--projector-hidden", type=int, default=768)
+    parser.add_argument("--memory-attention-heads", type=int, default=12)
+    parser.add_argument("--gate-type", choices=("none", "per_head", "token_wise_per_head", "token_wise_per_head_concat"), default="token_wise_per_head")
+    parser.add_argument("--gate-init", type=float, default=0.0, help="Pre-sigmoid gate logit")
+    parser.add_argument("--memory-attention-dropout", type=float, default=0.0)
+    parser.add_argument("--reader-dim", type=int, default=256)
+    parser.add_argument("--reader-layers", type=int, default=4)
+    parser.add_argument("--reader-heads", type=int, default=8)
+    parser.add_argument("--reader-ff-multiplier", type=int, default=4)
+    parser.add_argument("--reader-topology", choices=("causal", "bidirectional"), default="causal")
+    parser.add_argument("--reader-write", choices=("residual", "replace"), default="residual")
     parser.add_argument("--loss", choices=("ce", "margin"), default="ce")
     parser.add_argument("--negative-prepared")
     parser.add_argument("--margin", type=float, default=0.05)
@@ -34,6 +60,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=2000)
@@ -61,7 +90,33 @@ def main() -> None:
 
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation, mixed_precision="bf16")
     torch.manual_seed(args.seed)
-    cfg = DFMConfig(architecture=args.architecture)
+    fusion_layers = tuple(int(value) for value in args.fusion_layers.split(",") if value.strip())
+    slots_per_hit = 2 if args.memory_value_mode == "key_plus_continuation" else 1
+    cfg = DFMConfig(
+        architecture=args.architecture,
+        fusion_layers=fusion_layers,
+        memory_dim=args.memory_dim,
+        memory_slots=args.top_k * slots_per_hit,
+        traditional_projector_hidden=args.projector_hidden,
+        memory_attention_heads=args.memory_attention_heads,
+        gate_type=args.gate_type,
+        gate_init=args.gate_init,
+        memory_attention_dropout=args.memory_attention_dropout,
+        reader_dim=args.reader_dim,
+        reader_layers=args.reader_layers,
+        reader_heads=args.reader_heads,
+        reader_ff_multiplier=args.reader_ff_multiplier,
+        reader_topology=args.reader_topology,
+        reader_write=args.reader_write,
+    )
+    validate_data_contract(
+        args.prepared,
+        args.datastore,
+        chunk_size=args.chunk_size,
+        top_k=args.top_k,
+        memory_dim=args.memory_dim,
+        value_mode=args.memory_value_mode,
+    )
     model = DFMForCausalLM.from_pretrained(args.model, cfg)
     model.base.eval()  # frozen GPT-2 dropout must not add noise to paired forwards
 
@@ -73,10 +128,19 @@ def main() -> None:
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=MemoryCollator(Datastore(args.datastore)),
+        collate_fn=MemoryCollator(
+            Datastore(args.datastore),
+            chunk_size=args.chunk_size,
+            top_k=args.top_k,
+            value_mode=args.memory_value_mode,
+        ),
         num_workers=0,
     )
-    optimizer = AdamW(model.trainable_parameters(), lr=args.learning_rate, weight_decay=0.0)
+    optimizer = AdamW(
+        model.trainable_parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
 
     output = Path(args.output)
@@ -89,7 +153,9 @@ def main() -> None:
     total_steps = args.epochs * math.ceil(len(loader) / args.gradient_accumulation)
     if args.max_steps > 0:
         total_steps = min(total_steps, args.max_steps)
-    scheduler = get_linear_schedule_with_warmup(optimizer, 0, total_steps)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, args.warmup_steps, total_steps
+    )
     step = 0
     model.train()
     accelerator.unwrap_model(model).base.eval()
@@ -115,7 +181,7 @@ def main() -> None:
                     )
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)

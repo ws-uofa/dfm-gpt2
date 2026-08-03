@@ -13,6 +13,31 @@ from torch import Tensor
 from torch.utils.data import Dataset as TorchDataset
 
 
+def validate_data_contract(
+    prepared_root: str | Path,
+    datastore_root: str | Path,
+    *,
+    chunk_size: int,
+    top_k: int,
+    memory_dim: int,
+    value_mode: str,
+) -> None:
+    """Fail early when an ablation config does not match its artifacts."""
+
+    prepared = json.loads((Path(prepared_root) / "meta.json").read_text())
+    datastore = json.loads((Path(datastore_root) / "meta.json").read_text())
+    expected_chunk = int(prepared.get("chunk_size", datastore.get("chunk_size", -1)))
+    stored_top_k = int(prepared.get("top_k", prepared.get("stored_top_k", -1)))
+    if chunk_size != expected_chunk:
+        raise ValueError(f"chunk_size={chunk_size} but artifact uses {expected_chunk}")
+    if not 0 < top_k <= stored_top_k:
+        raise ValueError(f"top_k={top_k} but artifact stores {stored_top_k}")
+    if memory_dim != int(datastore["embedding_dim"]):
+        raise ValueError("memory_dim does not match datastore embeddings")
+    if value_mode != "key" and not datastore.get("future_embeddings_file"):
+        raise ValueError(f"value_mode={value_mode} requires continuation embeddings")
+
+
 class LazyPartsDataset(TorchDataset):
     """Random access over the sharded Hugging Face parts used by the full build."""
 
@@ -91,30 +116,53 @@ class Datastore:
         self.size = int(meta["num_chunks"])
         self.dim = int(meta["embedding_dim"])
         self.keys = np.load(root / meta["embeddings_file"], mmap_mode="r")
-        self.future = np.load(root / meta["future_embeddings_file"], mmap_mode="r")
-        if self.keys.shape != (self.size, self.dim) or self.future.shape != (self.size, self.dim):
+        future_file = meta.get("future_embeddings_file")
+        self.future = np.load(root / future_file, mmap_mode="r") if future_file else None
+        if self.keys.shape != (self.size, self.dim):
             raise ValueError("datastore embedding shapes do not match meta.json")
+        if self.future is not None and self.future.shape != (self.size, self.dim):
+            raise ValueError("future embedding shape does not match meta.json")
 
-    def lookup(self, ids: Tensor) -> tuple[Tensor, Tensor]:
-        """Return interleaved [key, continuation] slots and their validity."""
+    def lookup(self, ids: Tensor, value_mode: str) -> tuple[Tensor, Tensor]:
+        """Return key, continuation, or interleaved key+continuation slots."""
 
         valid = ids >= 0
         safe = ids.clamp_min(0).cpu().numpy()
         keys = torch.from_numpy(np.asarray(self.keys[safe]).copy())
+        if value_mode == "key":
+            return keys, valid
+        if self.future is None:
+            raise ValueError(f"value_mode={value_mode!r} requires future embeddings")
         future = torch.from_numpy(np.asarray(self.future[safe]).copy())
+        if value_mode == "continuation":
+            return future, valid
+        if value_mode != "key_plus_continuation":
+            raise ValueError(f"unsupported memory value mode: {value_mode}")
         memory = torch.stack((keys, future), dim=-2).flatten(-3, -2)
         mask = torch.stack((valid, valid), dim=-1).flatten(-2, -1)
         return memory, mask
 
 
 class MemoryCollator:
-    def __init__(self, datastore: Datastore, chunk_size: int = 16) -> None:
+    def __init__(
+        self,
+        datastore: Datastore,
+        *,
+        chunk_size: int = 16,
+        top_k: int = 16,
+        value_mode: str = "key_plus_continuation",
+    ) -> None:
         self.datastore = datastore
         self.chunk_size = chunk_size
+        self.top_k = top_k
+        self.value_mode = value_mode
 
     def _memory(self, rows: list[dict[str, Any]], key: str) -> tuple[Tensor, Tensor]:
         ids = torch.tensor([row[key] for row in rows], dtype=torch.long)
-        chunk_memory, chunk_mask = self.datastore.lookup(ids)
+        if self.top_k <= 0 or self.top_k > ids.shape[-1]:
+            raise ValueError(f"top_k must be in [1, {ids.shape[-1]}]")
+        ids = ids[..., : self.top_k]
+        chunk_memory, chunk_mask = self.datastore.lookup(ids, self.value_mode)
         # Every token in one LM chunk sees the retrieval result attached to that chunk.
         memory = chunk_memory.repeat_interleave(self.chunk_size, dim=1)
         mask = chunk_mask.repeat_interleave(self.chunk_size, dim=1)

@@ -17,6 +17,7 @@ def test_invalid_memory_is_exact_noop(architecture: str) -> None:
         fusion_layers=(0, 1),
         memory_dim=12,
         memory_slots=4,
+        memory_attention_heads=4,
         reader_dim=16,
         reader_layers=1,
         reader_heads=4,
@@ -33,6 +34,14 @@ def test_invalid_memory_is_exact_noop(architecture: str) -> None:
 
 
 def test_only_memory_modules_are_trainable() -> None:
-    model = DFMForCausalLM(tiny_base(), DFMConfig(fusion_layers=(0,), memory_dim=12, memory_slots=4))
+    model = DFMForCausalLM(
+        tiny_base(),
+        DFMConfig(
+            fusion_layers=(0,),
+            memory_dim=12,
+            memory_slots=4,
+            memory_attention_heads=4,
+        ),
+    )
     assert all(not parameter.requires_grad for parameter in model.base.parameters())
     assert sum(parameter.numel() for parameter in model.trainable_parameters()) > 0

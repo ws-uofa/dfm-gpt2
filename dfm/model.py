@@ -14,13 +14,13 @@ from .config import DFMConfig
 class MemoryProjector(nn.Module):
     """Shared Qwen-embedding to GPT-2-hidden projection used by traditional DFM."""
 
-    def __init__(self, memory_dim: int, hidden_dim: int) -> None:
+    def __init__(self, memory_dim: int, hidden_dim: int, intermediate_dim: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(memory_dim),
-            nn.Linear(memory_dim, hidden_dim),
+            nn.Linear(memory_dim, intermediate_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(intermediate_dim, hidden_dim),
         )
 
     def forward(self, memory: Tensor) -> Tensor:
@@ -30,7 +30,14 @@ class MemoryProjector(nn.Module):
 class GatedMemoryAttention(nn.Module):
     """Token-wise, per-head cross-attention followed by a sigmoid residual gate."""
 
-    def __init__(self, hidden_dim: int, heads: int, gate_init: float) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        heads: int,
+        gate_type: str,
+        gate_init: float,
+        dropout: float,
+    ) -> None:
         super().__init__()
         if hidden_dim % heads:
             raise ValueError("GPT-2 hidden size must be divisible by attention heads")
@@ -40,7 +47,21 @@ class GatedMemoryAttention(nn.Module):
         self.k = nn.Linear(hidden_dim, hidden_dim)
         self.v = nn.Linear(hidden_dim, hidden_dim)
         self.out = nn.Linear(hidden_dim, hidden_dim)
-        self.gate = nn.Parameter(torch.full((heads,), float(gate_init)))
+        self.dropout = nn.Dropout(dropout)
+        self.gate_type = gate_type
+        self.gate = None
+        self.gate_proj = None
+        if gate_type == "per_head":
+            self.gate = nn.Parameter(torch.full((heads,), float(gate_init)))
+        elif gate_type == "token_wise_per_head":
+            self.gate_proj = nn.Linear(hidden_dim, heads)
+        elif gate_type == "token_wise_per_head_concat":
+            self.gate_proj = nn.Linear(hidden_dim * 2, heads)
+        elif gate_type != "none":
+            raise ValueError(f"unsupported gate_type: {gate_type}")
+        if self.gate_proj is not None:
+            nn.init.zeros_(self.gate_proj.weight)
+            nn.init.constant_(self.gate_proj.bias, gate_init)
 
     def forward(self, hidden: Tensor, memory: Tensor, valid: Tensor) -> Tensor:
         batch, tokens, slots, width = memory.shape
@@ -49,13 +70,20 @@ class GatedMemoryAttention(nn.Module):
         v = self.v(memory).view(batch, tokens, slots, self.heads, self.head_dim)
         scores = torch.einsum("bthd,btshd->bths", q, k) / math.sqrt(self.head_dim)
         scores = scores.masked_fill(~valid[:, :, None, :], torch.finfo(scores.dtype).min)
-        weights = scores.softmax(dim=-1)
+        weights = self.dropout(scores.softmax(dim=-1))
         # Avoid NaNs and writes for chunks with no valid memory (the first chunk).
         has_memory = valid.any(dim=-1)
         weights = torch.where(has_memory[:, :, None, None], weights, torch.zeros_like(weights))
         update = torch.einsum("bths,btshd->bthd", weights, v)
-        update = update * self.gate.sigmoid()[None, None, :, None]
-        update = self.out(update.reshape(batch, tokens, width))
+        flat_update = update.reshape(batch, tokens, width)
+        if self.gate_type == "none":
+            gate = 1.0
+        elif self.gate_type == "per_head":
+            gate = self.gate.sigmoid()[None, None, :, None]
+        else:
+            gate_input = hidden if self.gate_type == "token_wise_per_head" else torch.cat((hidden, flat_update), dim=-1)
+            gate = self.gate_proj(gate_input).sigmoid().unsqueeze(-1)
+        update = self.out((update * gate).reshape(batch, tokens, width))
         return hidden + update * has_memory[:, :, None]
 
 
@@ -79,6 +107,8 @@ class TransformerReader(nn.Module):
         )
         self.reader = nn.TransformerEncoder(layer, cfg.reader_layers, norm=nn.LayerNorm(width))
         self.out = nn.Linear(width, hidden_dim, bias=False)
+        self.topology = cfg.reader_topology
+        self.write = cfg.reader_write
 
     def forward(self, hidden: Tensor, memory: Tensor, valid: Tensor) -> Tensor:
         batch, tokens, slots, _ = memory.shape
@@ -88,9 +118,21 @@ class TransformerReader(nn.Module):
         sequence = sequence + self.position[: slots + 1]
         flat = sequence.view(batch * tokens, slots + 1, -1)
         padding = torch.cat((~valid, torch.zeros_like(valid[:, :, :1])), dim=2)
-        encoded = self.reader(flat, src_key_padding_mask=padding.view(batch * tokens, slots + 1))
+        causal_mask = None
+        if self.topology == "causal":
+            causal_mask = torch.triu(
+                torch.ones(slots + 1, slots + 1, dtype=torch.bool, device=flat.device),
+                diagonal=1,
+            )
+        encoded = self.reader(
+            flat,
+            mask=causal_mask,
+            src_key_padding_mask=padding.view(batch * tokens, slots + 1),
+        )
         update = self.out(encoded[:, -1]).view(batch, tokens, -1)
-        return hidden + update * valid.any(dim=-1, keepdim=True)
+        has_memory = valid.any(dim=-1, keepdim=True)
+        fused = hidden + update if self.write == "residual" else update
+        return torch.where(has_memory, fused, hidden)
 
 
 class DFMForCausalLM(nn.Module):
@@ -110,9 +152,20 @@ class DFMForCausalLM(nn.Module):
             parameter.requires_grad = False
 
         if cfg.architecture == "traditional":
-            self.projector = MemoryProjector(cfg.memory_dim, hidden)
+            self.projector = MemoryProjector(
+                cfg.memory_dim, hidden, cfg.traditional_projector_hidden
+            )
             self.fusion = nn.ModuleDict(
-                {str(i): GatedMemoryAttention(hidden, base.config.n_head, cfg.gate_init) for i in cfg.fusion_layers}
+                {
+                    str(i): GatedMemoryAttention(
+                        hidden,
+                        cfg.memory_attention_heads,
+                        cfg.gate_type,
+                        cfg.gate_init,
+                        cfg.memory_attention_dropout,
+                    )
+                    for i in cfg.fusion_layers
+                }
             )
         else:
             self.projector = None
