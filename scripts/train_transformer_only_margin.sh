@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Intent: apply the latest retrieved-vs-random margin objective to the strongest
-# transformer-only residual reader configuration.
+# Intent: apply the latest retrieved-vs-random margin objective to the default
+# performance/parameter tradeoff transformer-only residual reader.
 : "${GPT2_MODEL:?Set GPT2_MODEL}"; : "${WT103_ARTIFACT:?Set WT103_ARTIFACT}"; : "${DFM_RUNS:?Set DFM_RUNS}"
 PYTHON_BIN=${PYTHON_BIN:-python}
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy

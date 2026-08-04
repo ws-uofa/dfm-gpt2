@@ -14,6 +14,7 @@ class DFMConfig:
 
     architecture: Architecture = "traditional"
     fusion_layers: tuple[int, ...] = (0, 2, 5, 8, 10, 11)
+    fusion_timing: Literal["pre_attn", "post_attn"] | None = None
     memory_dim: int = 1024
     memory_slots: int = 32
 
@@ -22,15 +23,22 @@ class DFMConfig:
     memory_attention_heads: int = 12
     gate_type: Literal["none", "per_head", "token_wise_per_head", "token_wise_per_head_concat"] = "token_wise_per_head"
     gate_init: float = 0.0  # sigmoid(0) = 0.5
-    memory_attention_dropout: float = 0.0
+    memory_attention_dropout: float = 0.1
 
     # Transformer-only DFM: the strongest declared reader configuration.
     reader_dim: int = 256
-    reader_layers: int = 4
+    reader_layers: int = 2
     reader_heads: int = 8
     reader_ff_multiplier: int = 4
+    reader_dropout: float = 0.0
     reader_topology: Literal["causal", "bidirectional"] = "causal"
     reader_write: Literal["residual", "replace"] = "residual"
+    reader_sharing: Literal["independent", "shared"] = "independent"
+
+    def __post_init__(self) -> None:
+        if self.fusion_timing is None:
+            timing = "pre_attn" if self.architecture == "traditional" else "post_attn"
+            object.__setattr__(self, "fusion_timing", timing)
 
     def validate(self, gpt2_layers: int) -> None:
         if self.architecture not in {"traditional", "transformer_only"}:
@@ -39,8 +47,12 @@ class DFMConfig:
             raise ValueError("fusion_layers must contain non-negative indices")
         if max(self.fusion_layers) >= gpt2_layers:
             raise ValueError("fusion layer lies outside GPT-2")
+        if self.fusion_timing not in {"pre_attn", "post_attn"}:
+            raise ValueError("unsupported fusion_timing")
         if self.reader_dim % self.reader_heads:
             raise ValueError("reader_heads must divide reader_dim")
+        if not 0 <= self.reader_dropout < 1:
+            raise ValueError("reader_dropout must be in [0, 1)")
         if self.traditional_projector_hidden <= 0:
             raise ValueError("traditional_projector_hidden must be positive")
         if not 0 <= self.memory_attention_dropout < 1:
@@ -49,6 +61,8 @@ class DFMConfig:
             raise ValueError("unsupported reader_topology")
         if self.reader_write not in {"residual", "replace"}:
             raise ValueError("unsupported reader_write")
+        if self.reader_sharing not in {"independent", "shared"}:
+            raise ValueError("unsupported reader_sharing")
 
 
 @dataclass(frozen=True)

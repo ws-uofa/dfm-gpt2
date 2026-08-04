@@ -14,7 +14,8 @@ CPU 测试；不依赖原 `DeepFusionMem` 仓库，也不把模型、WikiText-10
 2. GPT-2 traditional DFM：冻结 GPT-2，共享 memory projector，在层
    `[0,2,5,8,10,11]` 使用独立 memory attention 和 token-wise per-head gate。
 3. GPT-2 transformer-only DFM：冻结 GPT-2，在相同六层加入独立的
-   `causal-d256-l4-h8` continuous-prefix Transformer reader，并做 residual write。
+   `causal-d256-l2-h8` continuous-prefix Transformer reader；默认 post-attn
+   query 和 residual write。该点是近期宽度/深度扫描的性能—参数折中默认值。
 4. 传统 CE loss，以及最新的 retrieved-vs-random margin loss：
 
    ```text
@@ -36,12 +37,15 @@ dfm/
   losses.py       next-token CE 与 margin 公式
   model.py        traditional / transformer-only GPT-2 DFM
   train.py        唯一训练程序
-  evaluate.py     retrieved/random/off 对齐评估
+  universal_eval.py  固定 280-row retrieved/random/off 严格评估
 scripts/
   build_wikitext103.py       分阶段建库程序
   build_random_negative.py   margin loss 的固定随机负样本
   build_latest_wikitext103.sh
   train_*.sh                 四个意图明确的训练入口
+  train_recent_protocol.sh   近期单实验可参数化入口
+  evaluate_universal_test.sh universal test 入口
+configs/experiments/         近期实验协议与完整 sweep 轴
 configs/paths.env.example    外部路径示例
 tests/                       无网络、CPU 单元测试
 ```
@@ -97,8 +101,8 @@ PYTHON_BIN=/plm-shared/sunsiyuan/.venvs/dfm/bin/python \
 
 也可以用 `$PYTHON_BIN scripts/check_environment.py` 输出机器可读的版本、路径与
 CUDA 可见性报告。当前开发机没有可见 GPU 属于正常现象；GPU 训练必须通过集群
-任务执行。`configs/accelerate/local_cpu.yaml` 用于本地检查，`1_gpu.yaml` 和
-`4_gpu.yaml` 用于相应的单节点集群容器。
+任务执行。近期训练入口按 `NUM_GPUS` 启动本机 Accelerate worker，并拒绝可见卡数
+不一致的容器。
 
 若在其他机器创建全新环境，可在个人持久快盘上执行：
 
@@ -133,7 +137,7 @@ $PYTHON_BIN scripts/build_wikitext103.py all \
 
 | CLI 参数 | 默认值 | 消融含义 |
 |---|---:|---|
-| `--packing-mode` | `cross_article` | 可选 `article_only`；后者不让 LM block 或 datastore pair 跨文章，并保留文章末尾 partial block |
+| `--packing-mode` | `cross_article` | 可选 `article_only`（`article_partial` 为历史别名）；后者仅让 training blocks/datastore pair 不跨文章并保留末尾 partial，validation/test target 仍固定 cross-article |
 | `--block-size` | `1024` | GPT-2 LM block 长度 |
 | `--chunk-size` | `16` | query/key/continuation chunk 长度，必须整除 block size |
 | `--top-k` | `16` | 每个 query 保留的近邻 key 数 |
@@ -194,14 +198,16 @@ bash scripts/train_traditional_ce.sh --max-steps 20 --batch-size 1
 ```
 
 默认学习率为 `1e-3`、weight decay 为 0、gradient clipping 为 1、seed 42。
-GPT-2 所有参数都冻结并保持 eval mode；checkpoint 只保存新增 DFM 参数及
-`run.json`，避免重复保存基础模型。
+GPT-2 所有参数都冻结并保持 eval mode；checkpoint 只保存新增 DFM 参数和对应
+`dfm-config.json`，run 根目录保存 `run.json` 与 `training-audit.json`，避免重复
+保存基础模型，同时绑定数据元信息、初始化、冻结主干和最终 checkpoint 哈希。
 
 ### 模型与训练消融参数
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
 | `--fusion-layers` | `0,2,5,8,10,11` | memory 插入层；层数由列表长度决定 |
+| `--fusion-timing` | traditional=`pre_attn`，t-only=`post_attn` | 精确选择 base self-attention residual 前后的 memory query/write 时机 |
 | `--memory-dim` | `1024` | datastore vector 维度，启动时与 meta 校验 |
 | `--chunk-size/--top-k` | `16/16` | 必须与 prepared artifact 兼容；允许读取已存 Top-K 的严格前缀 |
 | `--memory-value-mode` | `key_plus_continuation` | `key`、`continuation` 或二者交错 |
@@ -209,13 +215,15 @@ GPT-2 所有参数都冻结并保持 eval mode；checkpoint 只保存新增 DFM 
 | `--memory-attention-heads` | `12` | traditional DFM memory attention heads |
 | `--gate-type` | `token_wise_per_head` | `none`、静态 `per_head`、token-wise 或 concat token-wise |
 | `--gate-init` | `0.0` | sigmoid 前 logit；默认 gate=0.5 |
-| `--memory-attention-dropout` | `0` | traditional memory attention dropout |
-| `--reader-dim/layers/heads` | `256/4/8` | transformer-only reader 规模 |
+| `--memory-attention-dropout` | `0.1` | traditional memory attention dropout，匹配 GPT-2 `resid_pdrop` |
+| `--reader-dim/layers/heads` | `256/2/8` | transformer-only 默认 reader 规模 |
 | `--reader-ff-multiplier` | `4` | reader FFN expansion |
 | `--reader-topology` | `causal` | `causal` 或 `bidirectional` memory prefix attention |
 | `--reader-write` | `residual` | `residual` 或 `replace`；无有效 memory 时均严格 no-op |
+| `--reader-sharing` | `independent` | 六层独立 reader 或一个 `shared` reader |
 | `--loss` | `ce` | `ce` 或 `margin` |
 | `--margin/--margin-weight` | `0.05/0.1` | hinge margin 及其 loss 权重 |
+| `--preserve-negative-rng` | true | random-memory forward 后恢复 RNG，不扰动后续 positive path |
 | `--learning-rate` | `1e-3` | AdamW learning rate |
 | `--weight-decay` | `0` | AdamW weight decay |
 | `--warmup-steps` | `0` | linear scheduler warmup |
@@ -248,10 +256,60 @@ $PYTHON_BIN -m dfm.evaluate \
 - 建库协议对应 `wikitext103_database_construction_v1` 的推荐
   `cross_article/exclude-block` arm；历史完整测试 NLL 为 `2.935748`。
 - traditional DFM 保留其六层 token-wise per-head gated memory attention 结构。
-- transformer-only 保留最新 margin sweep 使用的
-  `causal-d256-l4-h8-residual` 结构。
+- transformer-only 默认采用近期 post-attn sweep 推荐的独立
+  `causal-d256-l2-h8-residual` 结构；d128/192/256/512、L1/2/4 和
+  independent/shared 均可通过参数严格重建。
 - 推荐 margin sweep 参数是 `(margin, weight)`：`(0.02,0.1)`、
   `(0.05,0.1)`、`(0.10,0.1)`、`(0.05,1.0)`；脚本默认 `(0.05,0.1)`。
 
 本仓库重新实现了算法闭环，不声称新实现已经复现历史数值。正式结论前必须完成
 full build receipt、冻结主干审计、同一 test rows 上的 retrieved/random/off 评估。
+
+## 近期统一实验协议
+
+近期实验的机器可读定义在
+`configs/experiments/recent_wikitext103.json`，来源是原实验 worktree commit
+`7e18203`。核心约束如下：
+
+- 无论训练 datastore 使用 `cross_article` 还是 `article_partial`，正式测试始终使用
+  相应 datastore 上生成的同一套 280-row cross-article test blocks；
+- 每个 checkpoint 同表报告 retrieved、seed-42 deterministic disjoint real-datastore
+  random 和 true memory-bypass off；
+- 输出 token-weighted NLL/PPL/top-1、sample-equal paired delta、10,000 次 paired
+  bootstrap 95% CI、random-ID audit/hash 和输入/checkpoint SHA256；
+- one epoch 固定 7,308 optimizer steps，five epochs 固定 36,540 steps，global
+  batch 16，seed 42，LR 1e-3 linear decay，无 warmup/weight decay；
+- checkpoint 训练审计必须证明 frozen GPT-2 fingerprint 不变，且所有可训练 tensor
+  至少获得一次 gradient 和 nonzero gradient。
+
+默认近期训练：
+
+```bash
+source scripts/activate_local_env.sh
+ARCHITECTURE=transformer_only RUN_NAME=t-only-d256-l2-post \
+  bash scripts/train_recent_protocol.sh
+```
+
+pre/post-attn、shared reader、五 epoch 或 margin arm 只改显式变量：
+
+```bash
+ARCHITECTURE=traditional FUSION_TIMING=post_attn EPOCHS=5 MAX_STEPS=36540 \
+  RUN_NAME=traditional-post-5e bash scripts/train_recent_protocol.sh
+
+ARCHITECTURE=transformer_only READER_SHARING=shared READER_LAYERS=4 \
+  RUN_NAME=t-only-d256-l4-shared bash scripts/train_recent_protocol.sh
+
+ARCHITECTURE=transformer_only LOSS=margin MARGIN=.05 MARGIN_WEIGHT=.1 \
+  RUN_NAME=t-only-margin-m05-w01 bash scripts/train_recent_protocol.sh
+```
+
+统一评测：
+
+```bash
+CHECKPOINT="$DFM_RUNS/t-only-d256-l2-post/step-00007308" \
+EVAL_OUTPUT="$DFM_RUNS/t-only-d256-l2-post/universal-test" \
+  bash scripts/evaluate_universal_test.sh
+```
+
+更详细的架构语义、矩阵和历史验收指标见
+`docs/WIKITEXT103_RECENT_PROTOCOL.md`。

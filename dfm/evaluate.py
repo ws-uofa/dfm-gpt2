@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--datastore", required=True)
     parser.add_argument("--architecture", choices=("traditional", "transformer_only"), required=True)
     parser.add_argument("--fusion-layers", default="0,2,5,8,10,11")
+    parser.add_argument("--fusion-timing", choices=("pre_attn", "post_attn"))
     parser.add_argument("--memory-dim", type=int, default=1024)
     parser.add_argument("--chunk-size", type=int, default=16)
     parser.add_argument("--top-k", type=int, default=16)
@@ -30,13 +31,15 @@ def main() -> None:
     parser.add_argument("--memory-attention-heads", type=int, default=12)
     parser.add_argument("--gate-type", choices=("none", "per_head", "token_wise_per_head", "token_wise_per_head_concat"), default="token_wise_per_head")
     parser.add_argument("--gate-init", type=float, default=0.0)
-    parser.add_argument("--memory-attention-dropout", type=float, default=0.0)
+    parser.add_argument("--memory-attention-dropout", type=float, default=0.1)
     parser.add_argument("--reader-dim", type=int, default=256)
-    parser.add_argument("--reader-layers", type=int, default=4)
+    parser.add_argument("--reader-layers", type=int, default=2)
     parser.add_argument("--reader-heads", type=int, default=8)
     parser.add_argument("--reader-ff-multiplier", type=int, default=4)
+    parser.add_argument("--reader-dropout", type=float, default=0.0)
     parser.add_argument("--reader-topology", choices=("causal", "bidirectional"), default="causal")
     parser.add_argument("--reader-write", choices=("residual", "replace"), default="residual")
+    parser.add_argument("--reader-sharing", choices=("independent", "shared"), default="independent")
     parser.add_argument("--output", required=True)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-samples", type=int)
@@ -70,6 +73,8 @@ def main() -> None:
     config = DFMConfig(
         architecture=args.architecture,
         fusion_layers=tuple(int(value) for value in args.fusion_layers.split(",") if value.strip()),
+        fusion_timing=args.fusion_timing
+        or ("pre_attn" if args.architecture == "traditional" else "post_attn"),
         memory_dim=args.memory_dim,
         memory_slots=args.top_k * slots_per_hit,
         traditional_projector_hidden=args.projector_hidden,
@@ -81,8 +86,10 @@ def main() -> None:
         reader_layers=args.reader_layers,
         reader_heads=args.reader_heads,
         reader_ff_multiplier=args.reader_ff_multiplier,
+        reader_dropout=args.reader_dropout,
         reader_topology=args.reader_topology,
         reader_write=args.reader_write,
+        reader_sharing=args.reader_sharing,
     )
     model = DFMForCausalLM.from_pretrained(args.model, config)
     state = torch.load(Path(args.checkpoint) / "dfm.pt", map_location="cpu", weights_only=True)

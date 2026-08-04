@@ -63,7 +63,14 @@ class GatedMemoryAttention(nn.Module):
             nn.init.zeros_(self.gate_proj.weight)
             nn.init.constant_(self.gate_proj.bias, gate_init)
 
-    def forward(self, hidden: Tensor, memory: Tensor, valid: Tensor) -> Tensor:
+    def forward(
+        self,
+        hidden: Tensor,
+        memory: Tensor,
+        valid: Tensor,
+        *,
+        return_update: bool = False,
+    ) -> Tensor:
         batch, tokens, slots, width = memory.shape
         q = self.q(hidden).view(batch, tokens, self.heads, self.head_dim)
         k = self.k(memory).view(batch, tokens, slots, self.heads, self.head_dim)
@@ -84,63 +91,101 @@ class GatedMemoryAttention(nn.Module):
             gate_input = hidden if self.gate_type == "token_wise_per_head" else torch.cat((hidden, flat_update), dim=-1)
             gate = self.gate_proj(gate_input).sigmoid().unsqueeze(-1)
         update = self.out((update * gate).reshape(batch, tokens, width))
-        return hidden + update * has_memory[:, :, None]
+        update = update * has_memory[:, :, None]
+        return update if return_update else hidden + update
+
+
+class TransformerReaderBlock(nn.Module):
+    """Pre-norm block matching the reader used by the WikiText experiments."""
+
+    def __init__(self, width: int, heads: int, ff_multiplier: int, dropout: float) -> None:
+        super().__init__()
+        self.attn_norm = nn.LayerNorm(width)
+        self.attn = nn.MultiheadAttention(width, heads, dropout=dropout, batch_first=True)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.ff_norm = nn.LayerNorm(width)
+        self.ff = nn.Sequential(
+            nn.Linear(width, width * ff_multiplier),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(width * ff_multiplier, width),
+        )
+        self.ff_dropout = nn.Dropout(dropout)
+
+    def forward(self, states: Tensor, valid: Tensor, causal: bool) -> Tensor:
+        size = states.size(1)
+        causal_mask = None
+        if causal:
+            causal_mask = torch.ones(size, size, dtype=torch.bool, device=states.device).triu(1)
+        normalized = self.attn_norm(states)
+        attended, _ = self.attn(
+            normalized,
+            normalized,
+            normalized,
+            attn_mask=causal_mask,
+            key_padding_mask=~valid,
+            need_weights=False,
+        )
+        states = states + self.attn_dropout(attended)
+        return states + self.ff_dropout(self.ff(self.ff_norm(states)))
 
 
 class TransformerReader(nn.Module):
-    """Continuous-prefix Transformer; memory tokens precede one GPT-2 query token."""
+    """Continuous-prefix reader with the exact recent-experiment parameter layout."""
 
     def __init__(self, cfg: DFMConfig, hidden_dim: int) -> None:
         super().__init__()
         width = cfg.reader_dim
-        self.memory_in = nn.Linear(cfg.memory_dim, width, bias=False)
-        self.query_in = nn.Linear(hidden_dim, width, bias=False)
-        self.position = nn.Parameter(torch.zeros(cfg.memory_slots + 1, width))
-        layer = nn.TransformerEncoderLayer(
-            d_model=width,
-            nhead=cfg.reader_heads,
-            dim_feedforward=width * cfg.reader_ff_multiplier,
-            dropout=0.0,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.memory_norm = nn.LayerNorm(cfg.memory_dim)
+        self.memory_in = nn.Linear(cfg.memory_dim, width)
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.query_in = nn.Linear(hidden_dim, width)
+        self.position = nn.Embedding(cfg.memory_slots + 1, width)
+        self.blocks = nn.ModuleList(
+            TransformerReaderBlock(
+                width,
+                cfg.reader_heads,
+                cfg.reader_ff_multiplier,
+                cfg.reader_dropout,
+            )
+            for _ in range(cfg.reader_layers)
         )
-        self.reader = nn.TransformerEncoder(layer, cfg.reader_layers, norm=nn.LayerNorm(width))
-        self.out = nn.Linear(width, hidden_dim, bias=False)
+        self.final_norm = nn.LayerNorm(width)
+        self.out = nn.Linear(width, hidden_dim)
         self.topology = cfg.reader_topology
         self.write = cfg.reader_write
 
-    def forward(self, hidden: Tensor, memory: Tensor, valid: Tensor) -> Tensor:
+    def forward(
+        self,
+        hidden: Tensor,
+        memory: Tensor,
+        valid: Tensor,
+        *,
+        return_update: bool = False,
+    ) -> Tensor:
         batch, tokens, slots, _ = memory.shape
-        mem = self.memory_in(memory)
-        query = self.query_in(hidden).unsqueeze(2)
+        safe_memory = torch.where(valid.unsqueeze(-1), memory, torch.zeros_like(memory))
+        mem = self.memory_in(self.memory_norm(safe_memory))
+        query = self.query_in(self.query_norm(hidden)).unsqueeze(2)
         sequence = torch.cat((mem, query), dim=2)
-        sequence = sequence + self.position[: slots + 1]
+        positions = torch.arange(slots + 1, device=hidden.device)
+        sequence = sequence + self.position(positions)
         flat = sequence.view(batch * tokens, slots + 1, -1)
-        padding = torch.cat((~valid, torch.zeros_like(valid[:, :, :1])), dim=2)
-        causal_mask = None
-        if self.topology == "causal":
-            causal_mask = torch.triu(
-                torch.ones(slots + 1, slots + 1, dtype=torch.bool, device=flat.device),
-                diagonal=1,
-            )
-        encoded = self.reader(
-            flat,
-            mask=causal_mask,
-            src_key_padding_mask=padding.view(batch * tokens, slots + 1),
-        )
-        update = self.out(encoded[:, -1]).view(batch, tokens, -1)
+        reader_valid = torch.cat((valid, torch.ones_like(valid[:, :, :1])), dim=2)
+        flat_valid = reader_valid.view(batch * tokens, slots + 1)
+        for block in self.blocks:
+            flat = block(flat, flat_valid, causal=self.topology == "causal")
+        candidate = self.out(self.final_norm(flat[:, -1])).view(batch, tokens, -1)
         has_memory = valid.any(dim=-1, keepdim=True)
-        fused = hidden + update if self.write == "residual" else update
-        return torch.where(has_memory, fused, hidden)
+        update = candidate if self.write == "residual" else candidate - hidden
+        update = update * has_memory
+        if return_update:
+            return update
+        return hidden + update
 
 
 class DFMForCausalLM(nn.Module):
-    """Frozen GPT-2 with readable memory modules inserted through block hooks.
-
-    Hooks keep Hugging Face's tested GPT-2 forward implementation intact. The
-    context is installed only for the duration of one forward pass.
-    """
+    """Frozen GPT-2 with memory writes at an exact pre/post-attention boundary."""
 
     def __init__(self, base: GPT2LMHeadModel, cfg: DFMConfig) -> None:
         super().__init__()
@@ -167,26 +212,91 @@ class DFMForCausalLM(nn.Module):
                     for i in cfg.fusion_layers
                 }
             )
+            self.shared_reader = None
+            self.post_attention_norms = nn.ModuleDict(
+                {
+                    str(i): nn.LayerNorm(hidden, eps=base.config.layer_norm_epsilon)
+                    for i in cfg.fusion_layers
+                }
+                if cfg.fusion_timing == "post_attn"
+                else {}
+            )
         else:
             self.projector = None
-            self.fusion = nn.ModuleDict({str(i): TransformerReader(cfg, hidden) for i in cfg.fusion_layers})
+            self.post_attention_norms = nn.ModuleDict()
+            if cfg.reader_sharing == "shared":
+                self.shared_reader = TransformerReader(cfg, hidden)
+                self.fusion = nn.ModuleDict()
+            else:
+                self.shared_reader = None
+                self.fusion = nn.ModuleDict(
+                    {str(i): TransformerReader(cfg, hidden) for i in cfg.fusion_layers}
+                )
 
         self._memory: tuple[Tensor, Tensor] | None = None
-        self._hooks = [base.transformer.h[i].register_forward_hook(self._hook(str(i))) for i in cfg.fusion_layers]
+        self._layer_inputs: dict[str, Tensor] = {}
+        self._hooks = []
+        for layer_idx in cfg.fusion_layers:
+            layer = str(layer_idx)
+            block = base.transformer.h[layer_idx]
+            if cfg.fusion_timing == "pre_attn":
+                if cfg.architecture == "transformer_only":
+                    self._hooks.append(
+                        block.register_forward_pre_hook(self._capture_layer_input(layer))
+                    )
+                self._hooks.append(block.attn.register_forward_hook(self._pre_attn_hook(layer)))
+            else:
+                self._hooks.append(
+                    block.ln_2.register_forward_pre_hook(self._post_attn_hook(layer))
+                )
 
     @classmethod
     def from_pretrained(cls, path: str, cfg: DFMConfig) -> "DFMForCausalLM":
         return cls(GPT2LMHeadModel.from_pretrained(path), cfg)
 
-    def _hook(self, layer: str):
-        def apply_memory(_module: nn.Module, _inputs: tuple[object, ...], output: object) -> object:
+    def _reader(self, layer: str) -> nn.Module:
+        return self.shared_reader if self.shared_reader is not None else self.fusion[layer]
+
+    def _capture_layer_input(self, layer: str):
+        def capture(_module: nn.Module, inputs: tuple[object, ...]) -> None:
+            if self._memory is not None:
+                self._layer_inputs[layer] = inputs[0]
+
+        return capture
+
+    def _pre_attn_hook(self, layer: str):
+        def apply_memory(_module: nn.Module, inputs: tuple[object, ...], output: object) -> object:
             if self._memory is None:
                 return output
-            hidden = output[0] if isinstance(output, tuple) else output
             memory, valid = self._memory
-            projected = self.projector(memory) if self.projector is not None else memory
-            fused = self.fusion[layer](hidden, projected, valid)
-            return (fused, *output[1:]) if isinstance(output, tuple) else fused
+            if self.dfm_config.architecture == "traditional":
+                query = inputs[0]  # the same LN(h_l) consumed by base self-attention
+                update = self.fusion[layer](
+                    query, self.projector(memory), valid, return_update=True
+                )
+            else:
+                query = self._layer_inputs.pop(layer)
+                update = self._reader(layer)(query, memory, valid, return_update=True)
+            attended = output[0] + update
+            return (attended, *output[1:])
+
+        return apply_memory
+
+    def _post_attn_hook(self, layer: str):
+        def apply_memory(_module: nn.Module, inputs: tuple[object, ...]) -> tuple[object, ...] | None:
+            if self._memory is None:
+                return None
+            hidden = inputs[0]  # h_l + SA(LN(h_l)), immediately before the MLP
+            memory, valid = self._memory
+            if self.dfm_config.architecture == "traditional":
+                query = self.post_attention_norms[layer](hidden)
+                update = self.fusion[layer](
+                    query, self.projector(memory), valid, return_update=True
+                )
+                fused = hidden + update
+            else:
+                fused = self._reader(layer)(hidden, memory, valid)
+            return (fused, *inputs[1:])
 
         return apply_memory
 
@@ -199,6 +309,7 @@ class DFMForCausalLM(nn.Module):
             yield
         finally:
             self._memory = None
+            self._layer_inputs.clear()
 
     def forward(
         self,

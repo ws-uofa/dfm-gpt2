@@ -1,0 +1,98 @@
+{
+  "protocol": "wikitext103_recent_experiments_v1",
+  "source_commit": "7e18203",
+  "universal_test": {
+    "target_packing": "cross_article",
+    "samples": 280,
+    "conditions": ["retrieved", "random", "off"],
+    "random_control": "deterministic-disjoint-real-datastore",
+    "random_seed": 42,
+    "bootstrap_resamples": 10000,
+    "bootstrap_seed": 42
+  },
+  "data_defaults": {
+    "block_size": 1024,
+    "chunk_size": 16,
+    "top_k": 16,
+    "memory_value_mode": "key_plus_continuation",
+    "training_packing": "cross_article",
+    "exclude_current_block": true,
+    "exclude_current_article": false
+  },
+  "training_defaults": {
+    "fusion_layers": [0, 2, 5, 8, 10, 11],
+    "global_batch": 16,
+    "learning_rate": 0.001,
+    "scheduler": "linear",
+    "warmup_steps": 0,
+    "weight_decay": 0.0,
+    "max_grad_norm": 1.0,
+    "preserve_negative_rng": true,
+    "seed": 42,
+    "one_epoch_steps": 7308,
+    "five_epoch_steps": 36540
+  },
+  "traditional_dfm": {
+    "default_timing": "pre_attn",
+    "timing_ablation": ["pre_attn", "post_attn"],
+    "gate_type": "token_wise_per_head",
+    "expected_added_params": {
+      "pre_attn": 15609416,
+      "post_attn": 15618632
+    }
+  },
+  "timing_ablation": {
+    "traditional": {
+      "timings": ["pre_attn", "post_attn"]
+    },
+    "transformer_only": {
+      "timings": ["pre_attn", "post_attn"],
+      "reader_dim": 192,
+      "reader_layers": 2,
+      "reader_heads": 6,
+      "reader_sharing": "independent",
+      "topology": "causal",
+      "write": "residual"
+    }
+  },
+  "transformer_only": {
+    "default": {
+      "timing": "post_attn",
+      "reader_dim": 256,
+      "reader_layers": 2,
+      "reader_heads": 8,
+      "reader_sharing": "independent",
+      "topology": "causal",
+      "write": "residual",
+      "ff_multiplier": 4,
+      "dropout": 0.0,
+      "expected_added_params": 13492224
+    },
+    "width_depth_sweep": {
+      "widths": [128, 192, 256, 512],
+      "depths": [1, 2, 4],
+      "heads_by_width": {"128": 4, "192": 6, "256": 8, "512": 16},
+      "sharing": ["independent", "shared"]
+    }
+  },
+  "loss_sweep": {
+    "architecture_baselines": {
+      "traditional": {"timing": "pre_attn"},
+      "transformer_only": {
+        "timing": "post_attn",
+        "reader_dim": 192,
+        "reader_layers": 2,
+        "reader_heads": 6,
+        "reader_sharing": "independent"
+      }
+    },
+    "common": [
+      {"loss": "ce", "margin": 0.0, "weight": 0.0},
+      {"loss": "margin", "margin": 0.02, "weight": 0.1},
+      {"loss": "margin", "margin": 0.05, "weight": 0.1},
+      {"loss": "margin", "margin": 0.10, "weight": 0.1}
+    ],
+    "traditional_strong_weight": {"loss": "margin", "margin": 0.10, "weight": 1.0},
+    "transformer_only_strong_weight": {"loss": "margin", "margin": 0.05, "weight": 1.0}
+  }
+}

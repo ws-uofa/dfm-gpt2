@@ -34,7 +34,12 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--packing-mode", choices=("cross_article", "article_only"), default="cross_article")
+    parser.add_argument(
+        "--packing-mode",
+        choices=("cross_article", "article_partial", "article_only"),
+        default="cross_article",
+        help="article_only is a readable alias for the historical article_partial protocol",
+    )
     parser.add_argument("--block-size", type=int, default=1024)
     parser.add_argument("--chunk-size", type=int, default=16)
     parser.add_argument("--top-k", type=int, default=16)
@@ -121,11 +126,18 @@ def blocks(stream: Iterable[int], size: int = 1024) -> Iterator[np.ndarray]:
             buffer.clear()
 
 
-def block_records(split: Dataset, tokenizer, args: argparse.Namespace):
+def block_records(
+    split: Dataset,
+    tokenizer,
+    args: argparse.Namespace,
+    *,
+    packing_mode: str | None = None,
+):
     """Yield tokens, mask, and per-chunk article IDs for either packing policy."""
 
     chunks_per_block = args.block_size // args.chunk_size
-    if args.packing_mode == "cross_article":
+    packing_mode = packing_mode or args.packing_mode
+    if packing_mode == "cross_article":
         token_buffer: list[int] = []
         article_buffer: list[int] = []
         for article_id, article_tokens in article_stream(split, tokenizer):
@@ -218,13 +230,27 @@ def stage_tokenize(args: argparse.Namespace) -> None:
         raise ValueError("block_size must be a positive multiple of chunk_size")
     counts = {}
     for split in SPLITS:
-        iterator = block_records(dataset[split], tokenizer, args)
+        target_packing = args.packing_mode if split == "train" else "cross_article"
+        iterator = block_records(dataset[split], tokenizer, args, packing_mode=target_packing)
         rows = list(islice(iterator, args.max_blocks)) if args.max_blocks else None
-        count = len(rows) if rows is not None else sum(1 for _ in block_records(dataset[split], tokenizer, args))
+        count = (
+            len(rows)
+            if rows is not None
+            else sum(
+                1
+                for _ in block_records(
+                    dataset[split], tokenizer, args, packing_mode=target_packing
+                )
+            )
+        )
         tokens = np.lib.format.open_memmap(tokens_root / f"{split}-blocks.npy", mode="w+", dtype=np.int32, shape=(count, args.block_size))
         masks = np.lib.format.open_memmap(tokens_root / f"{split}-masks.npy", mode="w+", dtype=np.int8, shape=(count, args.block_size))
         articles = np.lib.format.open_memmap(tokens_root / f"{split}-chunk-articles.npy", mode="w+", dtype=np.int64, shape=(count, args.block_size // args.chunk_size, 2))
-        source = rows if rows is not None else block_records(dataset[split], tokenizer, args)
+        source = (
+            rows
+            if rows is not None
+            else block_records(dataset[split], tokenizer, args, packing_mode=target_packing)
+        )
         for index, (row_tokens, row_mask, row_articles) in enumerate(source):
             tokens[index], masks[index], articles[index] = row_tokens, row_mask, row_articles
         tokens.flush(); masks.flush(); articles.flush()
@@ -254,7 +280,20 @@ def stage_tokenize(args: argparse.Namespace) -> None:
         for name, value in zip(fields, values):
             arrays[name][index] = value
     for array in arrays.values(): array.flush()
-    (tokens_root / "meta.json").write_text(json.dumps({"packing_mode": args.packing_mode, "block_size": args.block_size, "chunk_size": args.chunk_size, "pair_count": pair_count, "counts": counts}, indent=2) + "\n")
+    (tokens_root / "meta.json").write_text(
+        json.dumps(
+            {
+                "packing_mode": args.packing_mode,
+                "target_packing_mode": "cross_article",
+                "block_size": args.block_size,
+                "chunk_size": args.chunk_size,
+                "pair_count": pair_count,
+                "counts": counts,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
 
 
 class Embedder:
@@ -310,6 +349,7 @@ def stage_encode(args: argparse.Namespace) -> None:
     meta = {
         "protocol": "wikitext103_database_construction_v1",
         "packing_mode": args.packing_mode,
+        "target_packing_mode": "cross_article",
         "num_chunks": pair_count,
         "embedding_dim": encoder.dim,
         "embeddings_file": "embeddings.npy",
@@ -449,6 +489,7 @@ def stage_prepare(args: argparse.Namespace) -> None:
     meta = {
         "protocol": "wikitext103_database_construction_v1",
         "packing_mode": args.packing_mode,
+        "target_packing_mode": "cross_article",
         "exclude_current_block": args.exclude_current_block,
         "exclude_current_article": args.exclude_current_article,
         "block_size": args.block_size,

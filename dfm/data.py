@@ -101,8 +101,9 @@ class PairedDataset(TorchDataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         positive, negative = dict(self.positive[index]), self.negative[index]
-        if positive["input_ids"] != negative["input_ids"]:
-            raise ValueError(f"unaligned negative row at index {index}")
+        for key in ("input_ids", "attention_mask", "labels"):
+            if positive[key] != negative[key]:
+                raise ValueError(f"unaligned negative {key} at index {index}")
         positive["negative_retrieved_chunk_ids"] = negative["retrieved_chunk_ids"]
         return positive
 
